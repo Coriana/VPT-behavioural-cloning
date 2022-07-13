@@ -7,6 +7,7 @@
 from argparse import ArgumentParser
 import pickle
 import time
+from halo import Halo
 
 import gym
 import minerl
@@ -90,6 +91,8 @@ def behavioural_cloning_train(data_dir, in_model, in_weights, out_weights):
 
     start_time = time.time()
 
+    spinner = Halo(text=' Training ', spinner='dots')
+
     # Keep track of the hidden state per episode/trajectory.
     # DataLoader provides unique id for each episode, which will
     # be different even for the same trajectory when it is loaded
@@ -100,6 +103,7 @@ def behavioural_cloning_train(data_dir, in_model, in_weights, out_weights):
     loss_sum = 0
     loss_items = 0
     for batch_i, (batch_images, batch_actions, batch_episode_id) in enumerate(data_loader):
+        spinner.start()
         batch_loss = 0
         for image, action, episode_id in zip(batch_images, batch_actions, batch_episode_id):
             agent_action = agent._env_action_to_agent(action, to_torch=True, check_if_null=True)
@@ -150,9 +154,11 @@ def behavioural_cloning_train(data_dir, in_model, in_weights, out_weights):
         loss_sum += batch_loss
         if batch_i % LOSS_REPORT_RATE == 0:
             time_since_start = time.time() - start_time
+            spinner.stop()
             print(f"Time: {time_since_start:.2f}, Batches: {batch_i}, Avrg loss: {loss_sum / LOSS_REPORT_RATE:.4f}")
             loss_sum = 0
-
+            
+    spinner.succeed(text=' Trained ')
     state_dict = policy.state_dict()
     th.save(state_dict, out_weights)
 
