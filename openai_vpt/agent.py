@@ -17,6 +17,7 @@ POLICY_KWARGS = dict(
     attention_heads=16,
     attention_mask_style="clipped_causal",
     attention_memory_size=256,
+    attention_memory_compression=[(32, 1), (32, 3), (32, 9), (32, 27)],
     diff_mlp_embedding=False,
     hidsize=2048,
     img_shape=[128, 128, 3],

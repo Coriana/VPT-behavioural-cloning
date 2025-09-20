@@ -4,6 +4,7 @@ import torch as th
 from torch import nn
 
 import openai_vpt.lib.xf as xf
+from openai_vpt.lib.memory_cull import build_memory_cull_strategy
 from openai_vpt.lib.minecraft_util import store_args
 from openai_vpt.lib.tree_util import tree_map
 
@@ -128,6 +129,7 @@ class MaskedAttention(nn.Module):
         norm="none",
         log_scope="sa",
         use_muP_factor=False,
+        memory_cull=None,
     ):
         super().__init__()
 
@@ -138,6 +140,7 @@ class MaskedAttention(nn.Module):
         if mask == "none":
             mask = None
 
+        self.memory_cull = build_memory_cull_strategy(memory_cull, self.maxlen)
         self.orc_attn = xf.All2All(heads, self.maxlen, mask=mask is not None)
         self.orc_block = xf.SelfAttentionLayer(
             input_size,
@@ -148,6 +151,7 @@ class MaskedAttention(nn.Module):
             norm=norm,
             log_scope=log_scope,
             use_muP_factor=use_muP_factor,
+            state_compressor=self.memory_cull,
         )
 
     def initial_state(self, batchsize: int, device=None):
@@ -161,9 +165,11 @@ class MaskedAttention(nn.Module):
     def forward(self, input_bte, first_bt, state):
         """Forward propagation of a single layer"""
         state_mask, xf_state = state
+        prev_state_mask = state_mask
         t = first_bt.shape[1]
+        updated_mask = state_mask
         if self.mask == "clipped_causal":
-            new_mask, state_mask = get_mask(
+            new_mask, updated_mask = get_mask(
                 first_b11=first_bt[:, [[0]]],
                 state_mask=state_mask,
                 t=t,
@@ -174,6 +180,19 @@ class MaskedAttention(nn.Module):
             )
             self.orc_block.attn.mask = new_mask
         output, xf_state = self.orc_block(input_bte, xf_state)
+        if self.memory_cull is not None:
+            indices = getattr(self.orc_block, "_last_state_indices", None)
+            if indices is None:
+                raise RuntimeError("State compressor did not record indices for the cache update")
+            indices = indices.to(input_bte.device)
+            state_mask = self.memory_cull.update_mask(
+                prev_mask=prev_state_mask,
+                new_len=t,
+                indices=indices,
+                first=first_bt[:, [[0]]],
+            )
+        else:
+            state_mask = updated_mask
 
         return output, (state_mask, xf_state)
 

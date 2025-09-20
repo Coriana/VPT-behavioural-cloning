@@ -301,6 +301,7 @@ class SelfAttentionLayer(AttentionLayerBase):
         dtype="float32",
         norm="layer",
         cache_keep_len=None,
+        state_compressor=None,
         relattn=False,
         log_scope="sa",
         use_muP_factor=False,
@@ -328,6 +329,8 @@ class SelfAttentionLayer(AttentionLayerBase):
                     stride = 1
                 cache_keep_len = stride * attn.maxlen
         self.cache_keep_len = cache_keep_len
+        self.state_compressor = state_compressor
+        self._last_state_indices = None
         self.log_scope = log_scope
         self.use_muP_factor = use_muP_factor
 
@@ -378,7 +381,19 @@ class SelfAttentionLayer(AttentionLayerBase):
             tprev = prev.shape[1]
             startfull = max(tprev - self.cache_keep_len, 0)
             full = th.cat([prev[:, startfull:], new], dim=1)
-            outstate = full[:, max(full.shape[1] - (self.cache_keep_len), 0) :]
+            if self.state_compressor is None:
+                startstate = max(full.shape[1] - self.cache_keep_len, 0)
+                indices = th.arange(startstate, full.shape[1], device=full.device)
+                outstate = full[:, startstate:, :]
+            else:
+                index_list = self.state_compressor.select_indices(full.shape[1], new.shape[1])
+                indices = th.as_tensor(index_list, device=full.device, dtype=th.long)
+                if indices.numel() != self.cache_keep_len:
+                    raise RuntimeError(
+                        f"State compressor must return {self.cache_keep_len} indices, got {indices.numel()}"
+                    )
+                outstate = full.index_select(1, indices)
+            self._last_state_indices = indices
             # To see that the preceding slicing is correct, consider the case
             # that maxlen==1. Then `full` only consists of `new`, and
             # `outstate` is empty

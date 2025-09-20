@@ -144,6 +144,7 @@ class ResidualRecurrentBlock(nn.Module):
         attention_heads=8,
         attention_memory_size=2048,
         attention_mask_style="clipped_causal",
+        attention_memory_compression=None,
         log_scope="resblock",
         block_number=0,
     ):
@@ -188,6 +189,7 @@ class ResidualRecurrentBlock(nn.Module):
                 log_scope=log_scope + "/sa",
                 use_muP_factor=True,
                 mask=attention_mask_style,
+                memory_cull=attention_memory_compression,
             )
 
     def forward(self, x, first, state):
