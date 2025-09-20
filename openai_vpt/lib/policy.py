@@ -113,6 +113,7 @@ class MinecraftPolicy(nn.Module):
         attention_mask_style="clipped_causal",
         attention_heads=8,
         attention_memory_size=2048,
+        attention_memory_compression=None,
         use_pointwise_layer=True,
         pointwise_ratio=4,
         pointwise_use_activation=False,
@@ -179,6 +180,7 @@ class MinecraftPolicy(nn.Module):
             attention_mask_style=attention_mask_style,
             attention_heads=attention_heads,
             attention_memory_size=attention_memory_size,
+            attention_memory_compression=attention_memory_compression,
             n_block=n_recurrence_layers,
         )
 
