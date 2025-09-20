@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import List, Optional, Sequence, Set, Tuple, Union
 
 import torch as th
 
@@ -114,39 +114,64 @@ class MemoryCullStrategy:
             return MemoryCullSelection(indices=empty, per_tier=[empty.clone() for _ in self.tiers])
 
         valid_steps = steps_row.index_select(0, valid_positions)
-        sorted_steps, order = th.sort(valid_steps, descending=True, stable=True)
-        sorted_positions = valid_positions.index_select(0, order)
+        # Sort by step so we can reason about oldest/newest ordering directly.
+        steps_list: List[Tuple[int, int]] = sorted(
+            zip(valid_steps.tolist(), valid_positions.tolist())
+        )
 
-        tier_last_step: List[Optional[int]] = [None] * len(self.tiers)
-        per_tier: List[List[int]] = [[] for _ in self.tiers]
+        used: List[int] = []
+        used_set: Set[int] = set()
+        per_tier_indices: List[List[int]] = [[] for _ in self.tiers]
 
-        for pos, step in zip(sorted_positions.tolist(), sorted_steps.tolist()):
-            for tier_idx, tier in enumerate(self.tiers):
-                if tier.max_keep == 0:
+        # Tier 0 always keeps the newest frames exactly as requested.
+        first_tier = self.tiers[0]
+        if first_tier.max_keep > 0 and steps_list:
+            newest = steps_list[-first_tier.max_keep :]
+            tier_indices = sorted(pos for _, pos in newest)
+            per_tier_indices[0] = tier_indices
+            used.extend(tier_indices)
+            used_set.update(tier_indices)
+
+        remaining = [entry for entry in steps_list if entry[1] not in used_set]
+
+        for tier_idx, tier in enumerate(self.tiers[1:], start=1):
+            if tier.max_keep == 0 or not remaining:
+                continue
+
+            tier_selected: List[int] = []
+            last_step: Optional[int] = None
+
+            for step_value, pos in remaining:
+                if last_step is not None and step_value - last_step < tier.stride:
                     continue
-                if len(per_tier[tier_idx]) >= tier.max_keep:
-                    continue
-                last = tier_last_step[tier_idx]
-                if last is None or last - step >= tier.stride:
-                    per_tier[tier_idx].append(pos)
-                    tier_last_step[tier_idx] = step
+
+                tier_selected.append(pos)
+                last_step = step_value
+                if len(tier_selected) >= tier.max_keep:
                     break
 
+            if tier_selected:
+                tier_selected.sort()
+                per_tier_indices[tier_idx] = tier_selected
+                used.extend(tier_selected)
+                used_set.update(tier_selected)
+                remaining = [entry for entry in steps_list if entry[1] not in used_set]
+            else:
+                per_tier_indices[tier_idx] = []
+
+        used = sorted(set(used))
+
         per_tier_tensors: List[th.Tensor] = []
-        combined_indices: List[int] = []
-        for indices in per_tier:
-            if indices:
-                sorted_indices = sorted(indices)
+        for tier_indices in per_tier_indices:
+            if tier_indices:
                 per_tier_tensors.append(
-                    th.tensor(sorted_indices, dtype=th.long, device=device)
+                    th.tensor(tier_indices, dtype=th.long, device=device)
                 )
-                combined_indices.extend(sorted_indices)
             else:
                 per_tier_tensors.append(th.empty(0, dtype=th.long, device=device))
 
-        if combined_indices:
-            combined_indices = sorted(set(combined_indices))
-            indices_tensor = th.tensor(combined_indices, dtype=th.long, device=device)
+        if used:
+            indices_tensor = th.tensor(used, dtype=th.long, device=device)
         else:
             indices_tensor = th.empty(0, dtype=th.long, device=device)
 

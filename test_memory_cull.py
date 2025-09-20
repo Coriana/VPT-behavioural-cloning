@@ -1,3 +1,5 @@
+from typing import List
+
 import torch as th
 
 from openai_vpt.lib import xf
@@ -83,3 +85,30 @@ def test_memory_cull_respects_real_time_strides():
             assert th.equal(state[2], full_steps.index_select(1, selection.indices))
         else:
             assert state[2].numel() == 0
+
+
+def test_memory_cull_populates_all_tiers_after_warmup():
+    tiers = [
+        MemoryTier(stride=1, max_keep=32),
+        MemoryTier(stride=3, max_keep=32),
+        MemoryTier(stride=9, max_keep=32),
+        MemoryTier(stride=27, max_keep=32),
+    ]
+    strategy = MemoryCullStrategy(tiers)
+
+    cached_steps: List[int] = []
+    selection = None
+    for step in range(2000):
+        cached_steps.append(step)
+        selection = strategy.select_indices(full=None, step_indices=[cached_steps])[0]
+        keep = selection.indices.tolist()
+        cached_steps = [cached_steps[i] for i in keep]
+
+    assert selection is not None
+
+    total_kept = 0
+    for tier, idx_tensor in zip(tiers, selection.per_tier):
+        assert idx_tensor.numel() == tier.max_keep
+        total_kept += tier.max_keep
+
+    assert len(cached_steps) == total_kept
