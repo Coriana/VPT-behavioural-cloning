@@ -138,24 +138,25 @@ class MemoryCullStrategy:
             if tier.max_keep == 0 or not remaining:
                 continue
 
-            tier_selected: List[int] = []
+            tier_selected: List[Tuple[int, int]] = []
             last_step: Optional[int] = None
 
-            for step_value, pos in remaining:
-                if last_step is not None and step_value - last_step < tier.stride:
+            for step_value, pos in reversed(remaining):
+                if last_step is not None and last_step - step_value < tier.stride:
                     continue
 
-                tier_selected.append(pos)
+                tier_selected.append((step_value, pos))
                 last_step = step_value
                 if len(tier_selected) >= tier.max_keep:
                     break
 
             if tier_selected:
-                tier_selected.sort()
-                per_tier_indices[tier_idx] = tier_selected
-                used.extend(tier_selected)
-                used_set.update(tier_selected)
-                remaining = [entry for entry in steps_list if entry[1] not in used_set]
+                tier_selected.reverse()
+                tier_positions = [pos for _, pos in tier_selected]
+                per_tier_indices[tier_idx] = tier_positions
+                used.extend(tier_positions)
+                used_set.update(tier_positions)
+                remaining = [entry for entry in remaining if entry[1] not in used_set]
             else:
                 per_tier_indices[tier_idx] = []
 

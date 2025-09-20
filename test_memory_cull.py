@@ -98,17 +98,47 @@ def test_memory_cull_populates_all_tiers_after_warmup():
 
     cached_steps: List[int] = []
     selection = None
-    for step in range(2000):
-        cached_steps.append(step)
-        selection = strategy.select_indices(full=None, step_indices=[cached_steps])[0]
+    total_steps = 2600
+    snapshot_step = 2000
+    snapshot_mid = None
+    first_full_step = [None] * len(tiers)
+
+    final_tier_steps: List[List[int]] = []
+
+    for step in range(total_steps):
+        full_steps = cached_steps + [step]
+        selection = strategy.select_indices(full=None, step_indices=[full_steps])[0]
         keep = selection.indices.tolist()
-        cached_steps = [cached_steps[i] for i in keep]
+
+        tier_step_lists = [
+            [full_steps[i] for i in tier_indices.tolist()]
+            for tier_indices in selection.per_tier
+        ]
+
+        for idx, (tier, steps_list) in enumerate(zip(tiers, tier_step_lists)):
+            if len(steps_list) == tier.max_keep and first_full_step[idx] is None:
+                first_full_step[idx] = step
+
+        if step == snapshot_step:
+            snapshot_mid = [steps[-1] if steps else -1 for steps in tier_step_lists]
+
+        cached_steps = [full_steps[i] for i in keep]
+        final_tier_steps = tier_step_lists
 
     assert selection is not None
+    assert snapshot_mid is not None
 
     total_kept = 0
-    for tier, idx_tensor in zip(tiers, selection.per_tier):
-        assert idx_tensor.numel() == tier.max_keep
+    for tier, step_list in zip(tiers, final_tier_steps):
+        assert len(step_list) == tier.max_keep
         total_kept += tier.max_keep
 
     assert len(cached_steps) == total_kept
+
+    for earlier, later in zip(first_full_step, first_full_step[1:]):
+        assert earlier is not None and later is not None
+        assert earlier < later
+
+    final_latest = [steps[-1] if steps else -1 for steps in final_tier_steps]
+    for mid, end in zip(snapshot_mid, final_latest):
+        assert end > mid
