@@ -173,7 +173,7 @@ class MaskedAttention(nn.Module):
                 device=input_bte.device,
             )
             self.orc_block.attn.mask = new_mask
-        output, xf_state = self.orc_block(input_bte, xf_state)
+        output, xf_state = self.orc_block(input_bte, xf_state, first_bt)
 
         return output, (state_mask, xf_state)
 

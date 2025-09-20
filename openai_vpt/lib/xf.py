@@ -331,13 +331,13 @@ class SelfAttentionLayer(AttentionLayerBase):
         self.log_scope = log_scope
         self.use_muP_factor = use_muP_factor
 
-    def residual(self, X_bte, state):
+    def residual(self, X_bte, state, first=None):
         X_bte = self.ln_x(X_bte)
         Q_bte = self.q_layer(X_bte)
         K_bte = self.k_layer(X_bte)
         V_bte = self.v_layer(X_bte)
-        if state:
-            state, K_bte, V_bte = self.update_state(state, K_bte, V_bte)
+        if state is not None:
+            state, K_bte, V_bte, _ = self.update_state(state, K_bte, V_bte, first=first)
         postproc_closure, Q_bte, K_bte, V_bte = self.attn.preproc_qkv(Q_bte, K_bte, V_bte)
         extra_btT = self.relattn_logits(X_bte, K_bte.shape[1]) if self.relattn else None
         A_bte = attention(
@@ -355,45 +355,105 @@ class SelfAttentionLayer(AttentionLayerBase):
         Aproj_bte = self.proj_layer(A_bte)
         return Aproj_bte, state
 
-    def forward(self, X_bte, state):
-        R_bte, state = self.residual(X_bte, state)
+    def forward(self, X_bte, state, first=None):
+        R_bte, state = self.residual(X_bte, state, first=first)
         return X_bte + R_bte, state
 
     def stateless_forward(self, X_bte):
         out_bte, _state = self.forward(X_bte, None)
         return out_bte
 
-    def update_state(self, state, K_bte, V_bte):
-        def append(prev, new):
-            """
-            Given `prev` keys from cache, and `new` keys,
-            returns (cache, full), where
-            - cache goes into the output state, length chosen so that on the
-                next timestep, there are enough cached timesteps to get the full
-                context of lenth self.maxlen.
-            - full is used for the current forward pass, with length chosen so
-                that the first timestep new[:, 0] gets to see a context of
-                self.maxlen.
-            """
-            tprev = prev.shape[1]
-            startfull = max(tprev - self.cache_keep_len, 0)
-            full = th.cat([prev[:, startfull:], new], dim=1)
-            outstate = full[:, max(full.shape[1] - (self.cache_keep_len), 0) :]
-            # To see that the preceding slicing is correct, consider the case
-            # that maxlen==1. Then `full` only consists of `new`, and
-            # `outstate` is empty
-            return outstate, full
+    def update_state(self, state, K_bte, V_bte, first=None):
+        if state is None:
+            raise ValueError("State must be provided when using cached attention")
 
-        instate_K, instate_V = state
-        outstate_K, K_bte = append(instate_K, K_bte)
-        outstate_V, V_bte = append(instate_V, V_bte)
+        if len(state) == 2:
+            instate_K, instate_V = state
+            device = K_bte.device
+            instate_steps = th.full(
+                (instate_K.shape[0], instate_K.shape[1]),
+                -1,
+                dtype=th.long,
+                device=device,
+            )
+        else:
+            instate_K, instate_V, instate_steps = state
+            device = instate_K.device
+            instate_steps = instate_steps.to(device=device, dtype=th.long)
+
+        bsz, new_t, _ = K_bte.shape
+
+        def _prepare_first(first_tensor):
+            if first_tensor is None:
+                return th.zeros((bsz, new_t), dtype=th.bool, device=device)
+            if not th.is_tensor(first_tensor):
+                first_tensor = th.as_tensor(first_tensor, device=device)
+            first_tensor = first_tensor.to(device=device, dtype=th.bool)
+            if first_tensor.dim() == 1:
+                first_tensor = first_tensor.unsqueeze(1)
+            if first_tensor.dim() != 2:
+                raise ValueError("`first` must be rank 1 or 2")
+            if first_tensor.shape[0] != bsz:
+                raise ValueError(
+                    f"`first` batch dimension {first_tensor.shape[0]} did not match {bsz}"
+                )
+            if first_tensor.shape[1] == 1 and new_t != 1:
+                first_tensor = first_tensor.expand(-1, new_t)
+            elif first_tensor.shape[1] != new_t:
+                raise ValueError(
+                    f"`first` time dimension {first_tensor.shape[1]} did not match {new_t}"
+                )
+            return first_tensor
+
+        first_bt = _prepare_first(first)
+
+        reset_mask = first_bt.any(dim=1)
+        if reset_mask.any():
+            instate_K = instate_K.clone()
+            instate_V = instate_V.clone()
+            instate_steps = instate_steps.clone()
+            instate_K[reset_mask] = 0
+            instate_V[reset_mask] = 0
+            instate_steps[reset_mask] = -1
+
+        if instate_steps.shape[1] == 0:
+            last_step = th.full((bsz,), -1, dtype=th.long, device=device)
+        else:
+            last_step = instate_steps[:, -1]
+
+        new_steps = []
+        for ti in range(new_t):
+            if first_bt[:, ti].any():
+                last_step = th.where(first_bt[:, ti], th.full_like(last_step, -1), last_step)
+            next_step = last_step + 1
+            new_steps.append(next_step)
+            last_step = next_step
+        if new_steps:
+            new_steps = th.stack(new_steps, dim=1)
+        else:
+            new_steps = instate_steps.new_full((bsz, 0), -1)
+
+        startfull = max(instate_K.shape[1] - self.cache_keep_len, 0)
+        prev_K = instate_K[:, startfull:]
+        prev_V = instate_V[:, startfull:]
+        prev_steps = instate_steps[:, startfull:]
+
+        K_full = th.cat([prev_K, K_bte], dim=1)
+        V_full = th.cat([prev_V, V_bte], dim=1)
+        steps_full = th.cat([prev_steps, new_steps], dim=1)
+
+        out_start = max(K_full.shape[1] - self.cache_keep_len, 0)
+        outstate_K = K_full[:, out_start:]
+        outstate_V = V_full[:, out_start:]
+        outstate_steps = steps_full[:, out_start:]
         assert outstate_K.shape[-2] <= self.cache_keep_len
-        return (outstate_K, outstate_V), K_bte, V_bte
+        return (outstate_K, outstate_V, outstate_steps), K_full, V_full, steps_full
 
     def initial_state(self, batchsize, initial_T=0):
         return (
             tu.zeros((batchsize, initial_T, self.x_size), dtype=self.dtype),
             tu.zeros((batchsize, initial_T, self.x_size), dtype=self.dtype),
+            th.full((batchsize, initial_T), -1, dtype=th.long, device=tu.dev()),
         )
 
     def empty_state(self):
